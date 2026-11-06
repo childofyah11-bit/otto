@@ -1,0 +1,149 @@
+package com.otto.paintbot
+
+import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityServiceInfo
+import android.content.Intent
+import android.os.Bundle
+import android.util.Log
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import java.lang.ref.WeakReference
+
+class AutoPaintAccessibilityService : AccessibilityService() {
+    private val gamePackage = "com.pbn.pbox.oakever.coloring.drawing.paint.by.number.colour.art"
+    private val playStorePkgs = setOf("com.android.vending", "com.google.android.finsky")
+    private val closeTextKeywords = listOf("close", "x", "skip", "later", "no thanks")
+    private val nextTextKeywords = listOf("next", "continue", "play", "start", "new")
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        val info = AccessibilityServiceInfo().apply {
+            eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
+                AccessibilityEvent.TYPE_WINDOWS_CHANGED or
+                AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
+                AccessibilityEvent.TYPE_VIEW_CLICKED or
+                AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED
+            feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
+            packageNames = arrayOf(gamePackage, *playStorePkgs.toTypedArray())
+            notificationTimeout = 100
+            flags = AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS or
+                AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
+        }
+        serviceInfo = info
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event == null) return
+
+        val packageName = event.packageName?.toString() ?: ""
+
+        if (playStorePkgs.contains(packageName) || packageName.contains("finsky")) {
+            reopenGame()
+            return
+        }
+
+        if (packageName != gamePackage) return
+
+        // Close ads when visible
+        if (maybeDismissAd()) {
+            return
+        }
+
+        // Try to move to the next puzzle / continue state when the app asks for it
+        if (maybeTriggerNextAction()) {
+            return
+        }
+
+        // Paint automation hook: this is where you would add the exact cell/tap logic
+        // for the level area. The current code intentionally avoids hard-coded taps
+        // because each build of the game can change the UI.
+        // See README for tuning instructions.
+    }
+
+    override fun onInterrupt() {
+        Log.d("AutoPaintService", "Accessibility service interrupted")
+    }
+
+    private fun maybeDismissAd(): Boolean {
+        val root = rootInActiveWindow ?: return false
+        val node = findNodeByText(root, closeTextKeywords)
+        if (node != null) {
+            node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            return true
+        }
+
+        // Fallback: if we see an obvious ad and a close button is present, tap it.
+        val closeButton = findNodeWithAnyText(root, closeTextKeywords)
+        if (closeButton != null) {
+            closeButton.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            return true
+        }
+
+        return false
+    }
+
+    private fun maybeTriggerNextAction(): Boolean {
+        val root = rootInActiveWindow ?: return false
+        val target = findNodeByText(root, nextTextKeywords)
+        if (target != null) {
+            target.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            return true
+        }
+        return false
+    }
+
+    private fun findNodeByText(root: AccessibilityNodeInfo, keywords: Collection<String>): AccessibilityNodeInfo? {
+        val normalized = keywords.map { it.lowercase() }
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+
+        while (stack.isNotEmpty()) {
+            val node = stack.removeFirst()
+
+            val nodeText = node.text?.toString()?.lowercase() ?: ""
+            val contentDesc = node.contentDescription?.toString()?.lowercase() ?: ""
+            val combined = "$nodeText $contentDesc"
+
+            if (normalized.any { combined.contains(it) }) {
+                return node
+            }
+
+            for (i in 0 until node.childCount) {
+                val child = node.getChild(i) ?: continue
+                stack.add(child)
+            }
+        }
+
+        return null
+    }
+
+    private fun findNodeWithAnyText(root: AccessibilityNodeInfo, keywords: Collection<String>): AccessibilityNodeInfo? {
+        val stack = ArrayDeque<AccessibilityNodeInfo>()
+        stack.add(root)
+
+        val normalized = keywords.map { it.lowercase() }
+        while (stack.isNotEmpty()) {
+            val node = stack.removeFirst()
+            val nodeText = node.text?.toString()?.lowercase() ?: ""
+            val desc = node.contentDescription?.toString()?.lowercase() ?: ""
+            if (normalized.any { nodeText.contains(it) || desc.contains(it) }) {
+                return node
+            }
+            for (i in 0 until node.childCount) {
+                node.getChild(i)?.let { stack.add(it) }
+            }
+        }
+        return null
+    }
+
+    private fun reopenGame() {
+        try {
+            val launchIntent = packageManager.getLaunchIntentForPackage(gamePackage)
+            ?: return
+            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            startActivity(launchIntent)
+        } catch (_: Exception) {
+            // Ignore launch failures; the service will retry on the next window event.
+        }
+    }
+}
